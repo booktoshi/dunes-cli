@@ -2,6 +2,7 @@
 
 const dogecore = require("bitcore-lib-doge");
 const axios = require("axios");
+const axiosRetry = require("axios-retry").default;
 const cheerio = require("cheerio");
 const fs = require("fs");
 const dotenv = require("dotenv");
@@ -9,6 +10,13 @@ const { PrivateKey, Address, Transaction, Script, Opcode } = dogecore;
 const { program } = require("commander");
 const bb26 = require("base26");
 const prompts = require("prompts");
+
+const axiosRetryOptions = {
+  retries: 10,
+  retryDelay: axiosRetry.exponentialDelay,
+};
+
+axiosRetry(axios, axiosRetryOptions);
 
 dotenv.config();
 
@@ -75,10 +83,16 @@ class Tag {
   static Flags = 2;
   static Dune = 4;
   static Limit = 6;
-  static Term = 8;
+  static OffsetEnd = 8;
   static Deadline = 10;
-  static DefaultOutput = 12;
-  static Burn = 254;
+  static Pointer = 12;
+  static HeightStart = 14;
+  static OffsetStart = 16;
+  static HeightEnd = 18;
+  static Cap = 20;
+  static Premine = 22;
+
+  static Cenotaph = 254;
 
   static Divisibility = 1;
   static Spacers = 3;
@@ -86,7 +100,7 @@ class Tag {
   static Nop = 255;
 
   static take(tag, fields) {
-    return fields.get(tag);
+    return fields[tag];
   }
 
   static encode(tag, value, payload) {
@@ -98,8 +112,9 @@ class Tag {
 
 class Flag {
   static Etch = 0;
-  static Mint = 1;
-  static Burn = 127;
+  static Terms = 1;
+  static Turbo = 2;
+  static Cenotaph = 127;
 
   static mask(flag) {
     return BigInt(1) << BigInt(flag);
@@ -120,42 +135,50 @@ class Flag {
 // Construct the OP_RETURN dune script with encoding of given values
 function constructScript(
   etching = null,
-  defaultOutput = undefined,
-  burn = null,
+  pointer = undefined,
+  cenotaph = null,
   edicts = []
 ) {
   const payload = [];
 
   if (etching) {
     // Setting flags for etching and minting
-    const flags = etching.mint
-      ? Number(Flag.mask(Flag.Etch)) | Number(Flag.mask(Flag.Mint))
-      : Number(Flag.mask(Flag.Etch));
+    let flags = Number(Flag.mask(Flag.Etch));
+    if (etching.turbo) flags |= Number(Flag.mask(Flag.Turbo));
+    if (etching.terms) flags |= Number(Flag.mask(Flag.Terms));
     Tag.encode(Tag.Flags, flags, payload);
+
     if (etching.dune) Tag.encode(Tag.Dune, etching.dune, payload);
-    if (etching.mint) {
-      // don't include deadline right now
-      //if (etching.mint.deadline) Tag.encode(Tag.Deadline, etching.mint.deadline, payload);
-      if (etching.mint.limit)
-        Tag.encode(Tag.Limit, etching.mint.limit, payload);
-      if (etching.mint.term) Tag.encode(Tag.Term, etching.mint.term, payload);
+    if (etching.terms) {
+      if (etching.terms.limit)
+        Tag.encode(Tag.Limit, etching.terms.limit, payload);
+      if (etching.terms.cap) Tag.encode(Tag.Cap, etching.terms.cap, payload);
+      if (etching.terms.offsetStart)
+        Tag.encode(Tag.OffsetStart, etching.terms.offsetStart, payload);
+      if (etching.terms.offsetEnd)
+        Tag.encode(Tag.OffsetEnd, etching.terms.offsetEnd, payload);
+      if (etching.terms.heightStart)
+        Tag.encode(Tag.HeightStart, etching.terms.heightStart, payload);
+      if (etching.terms.heightEnd)
+        Tag.encode(Tag.HeightEnd, etching.terms.heightEnd, payload);
     }
     if (etching.divisibility !== 0)
       Tag.encode(Tag.Divisibility, etching.divisibility, payload);
     if (etching.spacers !== 0)
       Tag.encode(Tag.Spacers, etching.spacers, payload);
     if (etching.symbol) Tag.encode(Tag.Symbol, etching.symbol, payload);
+    if (etching.premine) Tag.encode(Tag.Premine, etching.premine, payload);
   }
 
-  if (defaultOutput !== undefined) {
-    Tag.encode(Tag.DefaultOutput, defaultOutput, payload);
+  if (pointer !== undefined) {
+    Tag.encode(Tag.Pointer, pointer, payload);
   }
 
-  if (burn) {
-    Tag.encode(Tag.Burn, 0, payload);
+  if (cenotaph) {
+    Tag.encode(Tag.Cenotaph, 0, payload);
   }
 
-  if (edicts.length > 0) {
+  if (edicts && edicts.length > 0) {
     payload.push(varIntEncode(Tag.Body));
 
     const sortedEdicts = edicts.slice().sort((a, b) => {
@@ -265,19 +288,24 @@ class Edict {
   }
 }
 
-class Mint {
-  constructor(deadline, limit, term) {
-    this.deadline = deadline !== undefined ? deadline : null;
+class Terms {
+  constructor(limit, cap, offsetStart, offsetEnd, heightStart, heightEnd) {
     this.limit = limit !== undefined ? limit : null;
-    this.term = term !== undefined ? term : null;
+    this.cap = cap !== undefined ? cap : null;
+    this.offsetStart = offsetStart !== undefined ? offsetStart : null;
+    this.offsetEnd = offsetEnd !== undefined ? offsetEnd : null;
+    this.heightStart = heightStart !== undefined ? heightStart : null;
+    this.heightEnd = heightEnd !== undefined ? heightEnd : null;
   }
 }
 
 class Etching {
   // Constructor for Etching
-  constructor(divisibility, mint, dune, spacers, symbol) {
+  constructor(divisibility, terms, turbo, premine, dune, spacers, symbol) {
     this.divisibility = divisibility;
-    this.mint = mint !== undefined ? mint : null;
+    this.terms = terms !== undefined ? terms : null;
+    this.turbo = turbo !== undefined ? turbo : null;
+    this.premine = premine !== undefined ? premine : null;
     this.dune = dune;
     this.spacers = spacers;
     this.symbol = symbol;
@@ -324,7 +352,7 @@ const STEPS = [
 ];
 
 const SUBSIDY_HALVING_INTERVAL_10X = 2100000n;
-const FIRST_DUNE_HEIGHT = 5008400n;
+const FIRST_DUNE_HEIGHT = 5084000n;
 
 const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
@@ -346,8 +374,6 @@ function format(formatter) {
   for (const c of symbol.split("").reverse()) {
     formatter.write(c);
   }
-
-  return formatter.end();
 }
 
 const formatter = {
@@ -355,9 +381,6 @@ const formatter = {
   write(str) {
     this.output += str;
     return this;
-  },
-  end() {
-    console.log(this.output);
   },
 };
 
@@ -411,14 +434,38 @@ program
     let wallet = JSON.parse(fs.readFileSync(WALLET_PATH));
     const dunes = [];
     const getUtxosWithDunes = [];
-    for (const [index, utxo] of wallet.utxos.entries()) {
-      console.log(`Processing utxo number ${index} of ${wallet.utxos.length}`);
-      const dunesOnUtxo = await getDunesForUtxo(`${utxo.txid}:${utxo.vout}`);
-      dunes.push(...dunesOnUtxo);
-      if (dunesOnUtxo.length > 0) {
-        getUtxosWithDunes.push(utxo);
+    const CHUNK_SIZE = 10;
+
+    // Helper function to process a chunk of UTXOs
+    async function processChunk(utxosChunk, startIndex) {
+      const promises = utxosChunk.map((utxo, index) => {
+        console.log(
+          `Processing utxo number ${startIndex + index} of ${
+            wallet.utxos.length
+          }`
+        );
+        return getDunesForUtxo(`${utxo.txid}:${utxo.vout}`).then(
+          (dunesOnUtxo) => {
+            if (dunesOnUtxo.length > 0) {
+              getUtxosWithDunes.push(utxo);
+            }
+            return dunesOnUtxo;
+          }
+        );
+      });
+
+      const results = await Promise.all(promises);
+      for (const result of results) {
+        dunes.push(...result);
       }
     }
+
+    // Process UTXOs in chunks
+    for (let i = 0; i < wallet.utxos.length; i += CHUNK_SIZE) {
+      const chunk = wallet.utxos.slice(i, i + CHUNK_SIZE);
+      await processChunk(chunk, i);
+    }
+
     console.log(dunes);
     console.log(`Total dunes: ${dunes.length}`);
     console.log(`Number of utxos with dunes: ${getUtxosWithDunes.length}`);
@@ -430,21 +477,34 @@ program
   .argument("<address>", "Wallet address")
   .description("Prints tick balance of wallet")
   .action(async (dune_name, address) => {
-    const utxos = await getAddressUtxos(address);
+    const utxos = await fetchAllUnspentOutputs(address);
     let balance = 0n;
-    let symbol;
-    for (const [index, utxo] of utxos.entries()) {
-      const dunesOnUtxo = await getDunesForUtxo(`${utxo.txid}:${utxo.vout}`);
-      const amount = dunesOnUtxo
-        .filter(({ dune }) => dune === dune_name)
-        .map(({ amount }) => {
-          symbol = amount.match(/[a-zA-Z▣]+/)[0];
-          return BigInt(amount.match(/^(\d+)/)[1]);
-        });
-      if (amount > 0) balance += amount[0];
+    const utxoHashes = utxos.map((utxo) => `${utxo.txid}:${utxo.vout}`);
+    const chunkSize = 10; // Size of each chunk
+
+    // Function to chunk the utxoHashes array
+    const chunkedUtxoHashes = [];
+    for (let i = 0; i < utxoHashes.length; i += chunkSize) {
+      chunkedUtxoHashes.push(utxoHashes.slice(i, i + chunkSize));
     }
-    if (symbol) console.log(`${balance.toString()} ${symbol}`);
-    else console.log(0);
+
+    // Process each chunk
+    for (const chunk of chunkedUtxoHashes) {
+      const allDunes = await getDunesForUtxos(chunk);
+
+      for (const dunesInfo of allDunes) {
+        for (const singleDunesInfo of dunesInfo.dunes) {
+          const [name, { amount }] = singleDunesInfo;
+
+          if (name === dune_name) {
+            balance += BigInt(amount);
+          }
+        }
+      }
+    }
+
+    // Output the total balance
+    console.log(`${balance.toString()} ${dune_name}`);
   });
 
 program
@@ -459,26 +519,37 @@ program
 const getUtxosWithOutDunes = async () => {
   let wallet = JSON.parse(fs.readFileSync(WALLET_PATH));
 
-  const safeUtxos = [];
-  for (const [index, utxo] of wallet.utxos.entries()) {
-    console.log(`Processing utxo number ${index} of ${wallet.utxos.length}`);
-    const dunesOnUtxo = await getDunesForUtxo(`${utxo.txid}:${utxo.vout}`);
-    if (dunesOnUtxo.length === 0) {
-      safeUtxos.push(utxo);
+  const walletBalanceFromOrd = await axios.get(
+    `${process.env.ORD}dunes/balance/${wallet.address}?show_all=true`
+  );
+
+  const duneOutputMap = new Map();
+  for (const dune of walletBalanceFromOrd.data.dunes) {
+    for (const balance of dune.balances) {
+      duneOutputMap.set(`${balance.txid}:${balance.vout}`, {
+        ...balance,
+        dune: dune.dune,
+      });
     }
   }
 
-  return safeUtxos;
+  return wallet.utxos.filter(
+    (utxo) => !duneOutputMap.has(`${utxo.txid}:${utxo.vout}`)
+  );
 };
 
 const parseDuneId = (id, claim = false) => {
   // Check if Dune ID is in the expected format
-  const regex = /^\d+\/\d+$/;
-  if (!regex.test(id))
-    console.log(`Dune ID ${id} is not in the expected format e.g. 1234/1`);
+  const regex1 = /^\d+\:\d+$/;
+  const regex2 = /^\d+\/\d+$/;
+
+  if (!regex1.test(id) && !regex2.test(id))
+    console.log(
+      `Dune ID ${id} is not in the expected format e.g. 1234:1 or 1234/1`
+    );
 
   // Parse the id string to get height and index
-  const [heightStr, indexStr] = id.split("/");
+  const [heightStr, indexStr] = regex1.test(id) ? id.split(":") : id.split("/");
   const height = parseInt(heightStr, 10);
   const index = parseInt(indexStr, 10);
 
@@ -515,18 +586,41 @@ program
       console.error(
         `length of amounts ${amountsAsArray.length} and addresses ${addressesAsArray.length} are different`
       );
-      throw new Error(
-        `length of amounts ${amountsAsArray.length} and addresses ${addressesAsArray.length} are different`
-      );
+      process.exit(1);
     }
-    await walletSendDunes(
-      txhash,
-      vout,
-      dune,
-      decimals,
-      amountsAsArray,
-      addressesAsArray
-    );
+    try {
+      await walletSendDunes(
+        txhash,
+        vout,
+        dune,
+        decimals,
+        amountsAsArray,
+        addressesAsArray
+      );
+    } catch (error) {
+      console.error(error);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("sendDunesNoProtocol")
+  .description("Send dunes but without a protocol message")
+  .argument("<address>", "Receiver's address")
+  .argument("<utxo-amount>", "Number of dune utxos to send")
+  .argument("<dune>", "Dune to send")
+  .action(async (address, utxoAmount, dune) => {
+    try {
+      const res = await walletSendDunesNoProtocol(
+        address,
+        parseInt(utxoAmount),
+        dune
+      );
+      console.info(`Broadcasted transaction: ${JSON.stringify(res)}`);
+    } catch (error) {
+      console.error(error);
+      process.exit(1);
+    }
   });
 
 // sends the full balance of the specified dune
@@ -590,7 +684,7 @@ async function walletSendDunes(
   tx.from(dune_utxo);
 
   // we get the dune
-  const { id, divisibility } = await getDune(dune);
+  const { id, divisibility, limit } = await getDune(dune);
   console.log("id", id);
 
   // parse given id string to dune id
@@ -635,106 +729,217 @@ async function walletSendDunes(
   console.log(tx.hash);
 }
 
+async function walletSendDunesNoProtocol(address, utxoAmount, dune) {
+  let wallet = JSON.parse(fs.readFileSync(WALLET_PATH));
+
+  const walletBalanceFromOrd = await axios.get(
+    `${process.env.ORD}dunes/balance/${wallet.address}?show_all=true`
+  );
+
+  const duneOutputMap = new Map();
+  for (const dune of walletBalanceFromOrd.data.dunes) {
+    for (const balance of dune.balances) {
+      duneOutputMap.set(balance.txid, {
+        ...balance,
+        dune: dune.dune,
+      });
+    }
+  }
+
+  const nonDuneUtxos = wallet.utxos.filter(
+    (utxo) => !duneOutputMap.has(utxo.txid)
+  );
+
+  if (nonDuneUtxos.length === 0) {
+    throw new Error("no utxos without dunes found");
+  }
+
+  const gasUtxo = nonDuneUtxos.find((utxo) => utxo.satoshis > 100_000_000);
+
+  if (!gasUtxo) {
+    throw new Error(`no gas utxo found`);
+  }
+
+  let dunesUtxosValue = 0;
+  const dunesUtxos = [];
+
+  for (const utxo of wallet.utxos) {
+    if (dunesUtxos.length >= utxoAmount) {
+      break;
+    }
+
+    if (duneOutputMap.has(utxo.txid)) {
+      const duneOutput = duneOutputMap.get(utxo.txid);
+      if (duneOutput.dune === dune) {
+        dunesUtxos.push(utxo);
+        dunesUtxosValue += utxo.satoshis;
+      }
+    }
+  }
+
+  if (dunesUtxos.length < utxoAmount) {
+    throw new Error(`not enough dune utxos found`);
+  }
+
+  const response = await prompts({
+    type: "confirm",
+    name: "value",
+    message: `Transferring ${utxoAmount} utxos of ${dune}. Are you sure you want to proceed?`,
+    initial: true,
+  });
+
+  if (!response.value) {
+    throw new Error("Transaction aborted");
+  }
+
+  let tx = new Transaction();
+  tx.from(dunesUtxos);
+  tx.to(address, dunesUtxosValue);
+
+  await fund(wallet, tx);
+  return await broadcast(tx, true);
+}
+
+const _mintDune = async (id, amount, receiver) => {
+  console.log("Minting Dune...");
+  console.log(id, amount, receiver);
+
+  // Parse given id string to dune id
+  const duneId = parseDuneId(id, true);
+
+  if (amount == 0) {
+    const { id_, divisibility, limit } = await getDune(id);
+    amount = BigInt(limit) * BigInt(10 ** divisibility);
+  }
+
+  // mint dune with encoded id, amount on output 1
+  const edicts = [new Edict(duneId, amount, 1)];
+  console.log(edicts);
+
+  // Create script for given dune statements
+  const script = constructScript(null, undefined, null, edicts);
+
+  // getting the wallet balance
+  let wallet = JSON.parse(fs.readFileSync(WALLET_PATH));
+  let balance = wallet.utxos.reduce((acc, curr) => acc + curr.satoshis, 0);
+  if (balance == 0) throw new Error("no funds");
+
+  // creating new tx
+  let tx = new Transaction();
+
+  // output carries the protocol message
+  tx.addOutput(
+    new dogecore.Transaction.Output({ script: script, satoshis: 0 })
+  );
+
+  // add receiver output holding dune amount
+  tx.to(receiver, 100_000);
+
+  await fund(wallet, tx);
+
+  try {
+    await broadcast(tx, true);
+  } catch (e) {
+    console.log(e);
+  }
+
+  console.log(tx.hash);
+};
+
 program
   .command("mintDune")
   .description("Mint a Dune")
-  .argument("<id>", "id of the dune in format block/index e.g. 5927764/2")
-  .argument("<amount>", "amount to mint")
+  .argument("<id>", "id of the dune in format block:index e.g. 5927764:2")
+  .argument(
+    "<amount>",
+    "amount to mint (0 takes the limit of the dune as amount)"
+  )
   .argument("<receiver>", "address of the receiver")
-  .action(async (id, amount, receiver) => {
-    console.log("Minting Dune...");
-    console.log(id, amount, receiver);
+  .action(_mintDune);
 
-    // Parse given id string to dune id
-    const duneId = parseDuneId(id, true);
+function isSingleEmoji(str) {
+  const emojiRegex = /[\p{Emoji}]/gu;
 
-    // mint dune with encoded id, amount on output 1
-    const edicts = [new Edict(duneId, amount, 1)];
-    console.log(edicts);
+  const matches = str.match(emojiRegex);
 
-    // Create script for given dune statements
-    const script = constructScript(null, undefined, null, edicts);
-
-    // getting the wallet balance
-    let wallet = JSON.parse(fs.readFileSync(WALLET_PATH));
-    let balance = wallet.utxos.reduce((acc, curr) => acc + curr.satoshis, 0);
-    if (balance == 0) throw new Error("no funds");
-
-    // creating new tx
-    let tx = new Transaction();
-
-    // output carries the protocol message
-    tx.addOutput(
-      new dogecore.Transaction.Output({ script: script, satoshis: 0 })
-    );
-
-    // add receiver output holding dune amount
-    tx.to(receiver, 100_000);
-
-    await fund(wallet, tx);
-
-    try {
-      await broadcast(tx, true);
-    } catch (e) {
-      console.log(e);
-    }
-
-    console.log(tx.hash);
-  });
+  return matches ? matches.length === 1 : false;
+}
 
 program
   .command("deployOpenDune")
   .description("Deploy a Dune that is open for mint")
   .argument("<tick>", "Tick for the dune")
-  .argument(
-    "<term>",
-    "Number of blocks after deployment that minting stays open"
-  )
-  .argument("<limit>", "Max limit that can be minted in one transaction")
-  .argument("<deadline>", "Unix Timestamp up to which minting stays open")
-  .argument("<divisibility>", "divisibility of the dune. Max 38")
   .argument("<symbol>", "symbol")
+  .argument("<limit>", "Max amount that can be minted in one transaction")
+  .argument("<divisibility>", "divisibility of the dune. Max 38")
+  .argument("<cap>", "Max limit that can be minted overall")
+  .argument("<heightStart>", "Absolute block height where minting opens")
+  .argument("<heightEnd>", "Absolute block height where minting closes")
+  .argument("<offsetStart>", "Relative block height where minting opens")
   .argument(
-    "<mintAll>",
-    "Mints the whole supply in one output if minting is disabled, else it mints the limit for one transaction"
+    "<offsetEnd>",
+    "Relative block height where minting closes (former known as term)"
+  )
+  .argument(
+    "<premine>",
+    "Amount of allocated dunes to the etcher while etching"
+  )
+  .argument(
+    "<turbo>",
+    "Marks this etching as opting into future protocol changes."
   )
   .argument(
     "<openMint>",
-    "Set this to true to allow minting, taking limit, deadline and term as restrictions"
+    "Set this to true to allow minting, taking terms (limit, cap, height, offset) as restrictions"
   )
   .action(
     async (
       tick,
-      term,
-      limit,
-      deadline,
-      divisibility,
       symbol,
-      mintAll,
+      limit,
+      divisibility,
+      cap,
+      heightStart,
+      heightEnd,
+      offsetStart,
+      offsetEnd,
+      premine,
+      turbo,
       openMint
     ) => {
       console.log("Deploying open Dune...");
       console.log(
         tick,
-        term,
-        limit,
-        deadline,
-        divisibility,
         symbol,
-        mintAll,
+        limit,
+        divisibility,
+        cap,
+        heightStart,
+        heightEnd,
+        offsetStart,
+        offsetEnd,
+        premine,
+        turbo,
         openMint
       );
 
-      mintAll = mintAll.toLowerCase() === "true";
+      cap = cap === "null" ? null : cap;
+      heightStart = heightStart === "null" ? null : heightStart;
+      heightEnd = heightEnd === "null" ? null : heightEnd;
+      offsetStart = offsetStart === "null" ? null : offsetStart;
+      offsetEnd = offsetEnd === "null" ? null : offsetEnd;
+      premine = premine === "null" ? null : premine;
+      turbo = turbo === "null" ? null : turbo === "true";
+
       openMint = openMint.toLowerCase() === "true";
 
-      // should also add a check for which dune length is allowed currently
-      if (symbol && symbol.length != 1) {
-        // Invalid Symbol
-        console.error(
-          `Error: The argument symbol should have exactly 1 character, but is '${symbol}'`
-        );
-        process.exit(1);
+      if (symbol) {
+        if (symbol.length !== 1 && !isSingleEmoji(symbol)) {
+          console.error(
+            `Error: The argument symbol should have exactly 1 character, but is '${symbol}'`
+          );
+          process.exit(1);
+        }
       }
 
       const spacedDune = spacedDunefromStr(tick);
@@ -743,32 +948,32 @@ program
       const mininumAtCurrentHeight = minimumAtHeight(blockcount.data.result);
 
       if (spacedDune.dune.value < mininumAtCurrentHeight) {
-        console.error("Dune characters are invalid at current height.");
-        process.stdout.write(
-          `minimum at current height: ${mininumAtCurrentHeight} possible lowest tick: `
-        );
         const minAtCurrentHeightObj = { _value: mininumAtCurrentHeight };
         format.call(minAtCurrentHeightObj, formatter);
+        console.error("Dune characters are invalid at current height.");
+        process.stdout.write(
+          `minimum at current height: ${mininumAtCurrentHeight} possible lowest tick: ${formatter.output}\n`
+        );
         console.log(`dune: ${tick} value: ${spacedDune.dune.value}`);
         process.exit(1);
       }
 
-      const mint = openMint ? new Mint(deadline, limit, term) : null;
+      const terms = openMint
+        ? new Terms(limit, cap, offsetStart, offsetEnd, heightStart, heightEnd)
+        : null;
 
-      // then there is no minting possible after deployment, just while deploying, so atm mintAll must be true then.
       const etching = new Etching(
         divisibility,
-        mint,
+        terms,
+        turbo,
+        premine,
         spacedDune.dune.value,
         spacedDune.spacers,
-        symbol.charCodeAt(0)
+        symbol.codePointAt()
       );
 
-      // If mintAll is set, mint all dunes to output 1 of deployment transaction meaning that limit = max supply if minting is disabled
-      const edicts = mintAll ? [new Edict(0, limit, 1)] : [];
-
       // create script for given dune statements
-      const script = constructScript(etching, undefined, null, edicts);
+      const script = constructScript(etching, undefined, null, null);
 
       // getting the wallet balance
       let wallet = JSON.parse(fs.readFileSync(WALLET_PATH));
@@ -783,8 +988,8 @@ program
         new dogecore.Transaction.Output({ script: script, satoshis: 0 })
       );
 
-      // Create second output to sender if all dunes are directly minted in deployment
-      if (mintAll) tx.to(wallet.address, 100_000);
+      // Create second output to sender if dunes are directly allocated in etching
+      if (premine > 0) tx.to(wallet.address, 100_000);
 
       await fund(wallet, tx);
 
@@ -793,6 +998,321 @@ program
       console.log(tx.hash);
     }
   );
+
+async function parseScriptString(scriptString) {
+  const parts = scriptString.split(" ");
+
+  // Check if there is an OP_RETURN contained in the script string
+  if (parts.indexOf("OP_RETURN") === -1) {
+    throw new Error("No OP_RETURN output");
+  }
+
+  // Find the indices of the 'OP_PUSHBYTES' instructions
+  const pushBytesIndices = parts.reduce((indices, part, index) => {
+    if (part.startsWith("OP_PUSHBYTES")) {
+      indices.push(index + 1);
+    }
+    return indices;
+  }, []);
+
+  // If 'OP_PUSHBYTES' not found, assume we got 'OP_RETURN identifier msg' format
+  if (pushBytesIndices.length < 2) {
+    pushBytesIndices.push(1);
+    pushBytesIndices.push(2);
+  }
+
+  // Extract identifier and message
+  const identifier = parts[pushBytesIndices[0]];
+
+  /**
+   * Check Protocol Identifier
+   * Ord and most other explorers show this in hex representation.
+   * Some explorers show this in decimal representation,
+   * therefore we check both.
+   **/
+  if (identifier != IDENTIFIER) {
+    if (parseInt(identifier, 16) != IDENTIFIER) {
+      throw new Error("Couldn't find correct Protocol Identifier.");
+    }
+  }
+
+  const msg = parts[pushBytesIndices[1]];
+
+  // Parse msg to payload bytes
+  const payload = [];
+  for (let i = 0; i < msg.length; i += 2) {
+    payload.push(parseInt(msg.substr(i, 2), 16));
+  }
+
+  return payload;
+}
+
+async function decodePayload(payload) {
+  const integers = [];
+  let i = 0;
+
+  while (i < payload.length) {
+    const [integer, length] = varIntDecode(payload.slice(i));
+    integers.push(integer);
+    i += length;
+  }
+
+  return integers;
+}
+
+function varIntDecode(buffer) {
+  let n = 0n;
+  let i = 0;
+
+  while (true) {
+    if (i < buffer.length) {
+      const b = BigInt(parseInt(buffer[i], 10));
+      n = n * 128n;
+
+      if (b < 128) {
+        return [n + b, i + 1];
+      }
+
+      n = n + b - 127n;
+
+      i++;
+    } else {
+      return [n, i];
+    }
+  }
+}
+
+function parseIntegers(integers) {
+  const edicts = [];
+  const fields = {};
+
+  for (let i = 0; i < integers.length; i += 2) {
+    const tag = integers[i];
+    if (tag === BigInt(Tag.Body)) {
+      let id = 0n;
+      for (let j = i + 1; j < integers.length; j += 3) {
+        const chunk = integers.slice(j, j + 3);
+        id = id + BigInt(parseInt(chunk[0], 10));
+        edicts.push({
+          id,
+          amount: chunk[1],
+          output: chunk[2],
+        });
+      }
+      break;
+    }
+
+    if (i + 1 <= integers.length) {
+      const value = integers[i + 1];
+      if (!fields[tag]) fields[tag] = value;
+    } else {
+      break;
+    }
+  }
+
+  return { fields, edicts };
+}
+
+function writeDuneWithSpacers(dune, spacers) {
+  let output = "";
+
+  for (let i = 0n; i < dune.length; i++) {
+    const c = dune[i];
+    output += c;
+
+    if (spacers && i < dune.length - 1 && spacers & (1n << i)) {
+      output += "•";
+    }
+  }
+
+  return output;
+}
+
+// todo: this needs an update for the protocol changes
+program
+  .command("decodeDunesScript")
+  .description("Decode an OP_RETURN Dunes Script")
+  .argument("<script>", "Script from OP_RETURN output in tx")
+  .action(async (script) => {
+    const payload = await parseScriptString(script);
+    const payloadIntegers = await decodePayload(payload);
+    const { fields, edicts } = parseIntegers(payloadIntegers);
+
+    let flags = Tag.take(Tag.Flags, fields);
+    if (flags === undefined) flags = 0n;
+
+    let isMintable = Flag.take(Flag.Terms, flags);
+    let cenotaph = Flag.take(Flag.Cenotaph, flags);
+    let isEtching = Flag.take(Flag.Etch, flags);
+
+    // Show if this transaction burns dunes
+    if (cenotaph) console.log("Dunes burning");
+
+    // Show Etching if there is one
+    if (isEtching) {
+      let deadline = Tag.take(Tag.Deadline, fields);
+      let default_output = Tag.take(Tag.Pointer, fields);
+      let divisibility = Tag.take(Tag.Divisibility, fields);
+      let limit = Tag.take(Tag.Limit, fields);
+      let dune = Tag.take(Tag.Dune, fields);
+      let spacers = Tag.take(Tag.Spacers, fields);
+      let symbol = Tag.take(Tag.Symbol, fields);
+      let term = Tag.take(Tag.OffsetEnd, fields);
+
+      // Parse dune value to Spaced Dune as String
+      const minAtCurrentHeightObj = { _value: dune };
+      format.call(minAtCurrentHeightObj, formatter);
+      const spacedDuneStr = writeDuneWithSpacers(formatter.output, spacers);
+      symbol = String.fromCodePoint(parseInt(symbol, 10));
+
+      console.log(
+        `Deployment of Dune\n${spacedDuneStr}\nMintable: ${isMintable}\nDeadline: ${deadline}\nTerm: ${term}\nLimit: ${limit}\nDivisibility: ${divisibility}\nDefault Output: ${default_output}\nSymbol: ${symbol}`
+      );
+    }
+
+    // Show Mints if there are any
+    if (edicts.length > 0) {
+      const stringifiedArray = edicts.map((obj) => {
+        return {
+          id: obj.id.toString(),
+          amount: obj.amount.toString(),
+          output: obj.output.toString(),
+        };
+      });
+      const jsonString = `Mints:\n${JSON.stringify(stringifiedArray, null, 2)}`;
+      console.log(jsonString);
+    }
+  });
+
+const createUnsignedEtchTxFromUtxo = (
+  utxo,
+  id,
+  amountPerMint,
+  receiver,
+  senderWallet
+) => {
+  if (process.env.FEE_PER_KB) {
+    Transaction.FEE_PER_KB = parseInt(process.env.FEE_PER_KB);
+  } else {
+    Transaction.FEE_PER_KB = 100_000_000;
+  }
+  const duneId = parseDuneId(id, true);
+  const edicts = [new Edict(duneId, amountPerMint, 1)];
+  const script = constructScript(null, undefined, null, edicts);
+
+  let tx = new Transaction();
+  tx.addOutput(
+    new dogecore.Transaction.Output({ script: script, satoshis: 0 })
+  );
+  tx.to(receiver, 100_000);
+  tx.from(utxo);
+  tx.change(senderWallet.address);
+
+  return tx;
+};
+
+program.action("getBlockCount").action(async () => {
+  const res = await getblockcount();
+  console.log(res.data.result);
+});
+
+// @warning: this method is not dune aware.. so the dunes on the wallet are in danger of being spend
+program
+  .command("batchMintDune")
+  .argument("<id>", "id of the dune in format block:index e.g. 5927764:2")
+  .argument(
+    "<amountPerMint>",
+    "amount to mint per mint - consider the divisibility. (0 takes the limit of the dune as amount)"
+  )
+  .argument("<amountOfMints>", "how often you want to mint")
+  .argument("<receiver>", "address of the receiver")
+  .action(async (id, amountPerMint, amountOfMints, receiver) => {
+    let wallet = JSON.parse(fs.readFileSync(WALLET_PATH));
+
+    if (amountPerMint == 0) {
+      const { id_, divisibility, limit } = await getDune(id);
+      amountPerMint = BigInt(limit) * BigInt(10 ** divisibility);
+    }
+
+    /** CALCULATE FEES PER MINT */
+    // we calculate how much funds we need per mint. We take a random fake input for that
+    const utxo = {
+      txid: "52c086a5e206d44f562c1166a93ac1b2f8f95fe5c25d25f798de4228f0c26ff8",
+      vout: 2,
+      script: "76a914fe9c184fee58c13d13be8fccafaeb4ff6172b39088ac",
+      satoshis: 10 * 1e8, // 10 doge
+    };
+
+    const exampleEtchTx = createUnsignedEtchTxFromUtxo(
+      utxo,
+      id,
+      amountPerMint,
+      receiver,
+      wallet
+    );
+
+    const fee = exampleEtchTx.inputAmount - exampleEtchTx.outputAmount;
+
+    // the total doge we need per mint is the fee, the output and a safety buffer of 1.5 doge so that the change is not taken as fee
+    const totalDogeNeededPerMint = fee + 100_000 + 1.5 * 1e8;
+
+    /** BALANCE CHECK */
+    console.log("Checking balance...");
+    let balance = wallet.utxos.reduce((acc, curr) => acc + curr.satoshis, 0);
+    const fundingDemand = totalDogeNeededPerMint * amountOfMints + 10 * 1e8;
+    if (balance < fundingDemand) {
+      console.error(
+        `Not enough funds. You need ${
+          fundingDemand * 1e-8
+        } doge but you only have ${balance * 1e-8} doge`
+      );
+      process.exit(1);
+    }
+
+    /** CREATING SPLIT TX */
+    console.log("Creating split tx...");
+    let splitTx = new Transaction();
+    for (let i = 0; i < amountOfMints; i++) {
+      splitTx.to(wallet.address, totalDogeNeededPerMint);
+    }
+    await fund(wallet, splitTx);
+
+    /** CREATING THE ETCH TXS */
+    const unsignedEtchingTxs = [];
+    for ([i, splitUtxo] of splitTx.toObject().outputs.entries()) {
+      console.log(`Creating etch tx ${i + 1} of ${amountOfMints}`);
+      unsignedEtchingTxs.push(
+        createUnsignedEtchTxFromUtxo(
+          {
+            ...splitUtxo,
+            txid: splitTx.hash,
+            vout: i,
+          },
+          id,
+          amountPerMint,
+          receiver,
+          wallet
+        ).sign(wallet.privkey)
+      );
+    }
+
+    /** BROADCAST */
+    try {
+      console.log("Broadcasting split tx");
+      await broadcast(splitTx, true);
+      console.log("Broadcasting etch txs");
+      for (const [j, tx] of unsignedEtchingTxs.entries()) {
+        console.log(
+          `Broadcasting ${j} of ${unsignedEtchingTxs.length} etch tx | ${tx.hash}`
+        );
+        await broadcast(tx, true);
+        console.log(`Etch tx ${j} broadcasted`);
+      }
+    } catch (error) {
+      console.error(error);
+      process.exit(1);
+    }
+  });
 
 const walletCommand = program
   .command("wallet")
@@ -852,56 +1372,62 @@ function walletNew() {
   }
 }
 
+if (!process.env.UNSPENT_API) {
+  throw new Error("UNSPENT_API not set");
+}
+
+const unspentApi = axios.create({
+  baseURL: process.env.UNSPENT_API,
+  timeout: 100_000,
+});
+axiosRetry(unspentApi, axiosRetryOptions);
+
+async function fetchAllUnspentOutputs(walletAddress) {
+  let page = 1; // Start from the first page
+  let allUnspentOutputs = []; // Array to hold all unspent outputs
+  let hasMoreData = true; // Flag to keep the loop running until no more data is available
+
+  while (hasMoreData) {
+    try {
+      console.log(`Fetching unspent outputs for page ${page}...`);
+      // Fetch data from the API for the given page
+      const response = await unspentApi.get(`/${walletAddress}/${page}`);
+      const outputs = response.data.unspent_outputs;
+
+      // Check if the response contains any unspent outputs
+      if (outputs && outputs.length > 0) {
+        // Map and concatenate the current page's data to the total
+        const mappedOutputs = outputs.map((output) => ({
+          txid: output.tx_hash,
+          vout: output.tx_output_n,
+          script: output.script,
+          satoshis: Number(output.value),
+        }));
+
+        allUnspentOutputs = allUnspentOutputs.concat(mappedOutputs);
+        page++; // Increment the page number to fetch the next page
+      } else {
+        hasMoreData = false; // No more data to fetch, exit the loop
+      }
+    } catch (error) {
+      console.error("Error fetching unspent outputs:", error);
+      break; // Exit the loop in case of an error
+    }
+  }
+
+  return allUnspentOutputs; // Return the collected unspent outputs
+}
+
 async function walletSync() {
   let wallet = JSON.parse(fs.readFileSync(WALLET_PATH));
 
-  if (!process.env.UNSPENT_API) {
-    throw new Error("UNSPENT_API not set");
-  }
-
-  const unspentApi = axios.create({
-    baseURL: process.env.UNSPENT_API,
-    timeout: 100_000,
-  });
-
-  let response = await unspentApi.get(`${wallet.address}`);
-
-  wallet.utxos = response.data.unspent_outputs.map((output) => {
-    return {
-      txid: output.tx_hash,
-      vout: output.tx_output_n,
-      script: output.script,
-      satoshis: Number(output.value),
-    };
-  });
+  wallet.utxos = await fetchAllUnspentOutputs(wallet.address);
 
   fs.writeFileSync(WALLET_PATH, JSON.stringify(wallet, 0, 2));
 
   let balance = wallet.utxos.reduce((acc, curr) => acc + curr.satoshis, 0);
 
   console.log("balance", balance);
-}
-
-async function getAddressUtxos(address) {
-  if (!process.env.UNSPENT_API) {
-    throw new Error("UNSPENT_API not set");
-  }
-
-  const unspentApi = axios.create({
-    baseURL: process.env.UNSPENT_API,
-    timeout: 100_000,
-  });
-
-  let response = await unspentApi.get(`${address}`);
-
-  return response.data.unspent_outputs.map((output) => {
-    return {
-      txid: output.tx_hash,
-      vout: output.tx_output_n,
-      script: output.script,
-      satoshis: Number(output.value),
-    };
-  });
 }
 
 function walletBalance() {
@@ -955,12 +1481,14 @@ async function walletSplit(splits) {
   console.log(tx.hash);
 }
 
-async function fund(wallet, tx) {
-  tx.change(wallet.address);
-  delete tx._fee;
-
+async function fund(wallet, tx, onlySafeUtxos = true) {
   // we get the utxos without dunes
-  const utxosWithoutDunes = await getUtxosWithOutDunes();
+  let utxosWithoutDunes;
+  if (onlySafeUtxos) {
+    utxosWithoutDunes = await getUtxosWithOutDunes();
+  } else {
+    utxosWithoutDunes = wallet.utxos;
+  }
 
   // we sort the largest utxos first
   const sortedUtxos = utxosWithoutDunes.slice().sort((a, b) => {
@@ -972,22 +1500,30 @@ async function fund(wallet, tx) {
     return utxo.satoshis >= 1_000_000;
   });
 
+  const outputSum = tx.outputs.reduce((acc, curr) => acc + curr.satoshis, 0);
+  let isChangeAdded = false;
+  let inputSumAdded = 0;
+
   for (const utxo of largeUtxos) {
-    if (
-      tx.inputs.length &&
-      tx.outputs.length &&
-      tx.inputAmount >= tx.outputAmount + tx.getFee() &&
-      tx.inputAmount >= 1_500_000
-    ) {
+    if (inputSumAdded >= outputSum + tx._estimateFee()) {
       break;
     }
 
-    delete tx._fee;
     utxo.vout = Number(utxo.vout);
     utxo.satoshis = Number(utxo.satoshis);
     tx.from(utxo);
+    delete tx._fee;
+
     tx.change(wallet.address);
-    tx.sign(wallet.privkey);
+    isChangeAdded = true;
+    inputSumAdded += utxo.satoshis;
+  }
+
+  tx._fee = tx._estimateFee();
+  tx.sign(wallet.privkey);
+
+  if (!isChangeAdded) {
+    throw new Error("no change output added");
   }
 
   if (tx.inputAmount < tx.outputAmount + tx.getFee()) {
@@ -1073,9 +1609,23 @@ async function broadcast(tx, retry) {
     },
   };
 
+  const makePostRequest = async () => {
+    try {
+      const res = await axios.post(process.env.NODE_RPC_URL, body, options);
+      return res;
+    } catch (error) {
+      return await axios.post(
+        process.env.FALLBACK_NODE_RPC_URL || process.env.NODE_RPC_URL,
+        body,
+        options
+      );
+    }
+  };
+
+  let res;
   while (true) {
     try {
-      await axios.post(process.env.NODE_RPC_URL, body, options);
+      res = await retryAsync(async () => await makePostRequest(), 10, 30000);
       break;
     } catch (e) {
       if (!retry) throw e;
@@ -1085,9 +1635,16 @@ async function broadcast(tx, retry) {
         e.response.data.error &&
         e.response.data.error.message;
       if (msg && msg.includes("too-long-mempool-chain")) {
-        console.warn("retrying, too-long-mempool-chain");
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        console.warn("retrying in 15 secs, too-long-mempool-chain");
+
+        const blockRes = await getblockcount();
+
+        console.log(`Block is ${blockRes.data.result}`);
+
+        await new Promise((resolve) => setTimeout(resolve, 15000));
       } else {
+        await walletSync();
+        console.log(`Made a wallet sync for address ${wallet.address}`);
         throw e;
       }
     }
@@ -1098,6 +1655,35 @@ async function broadcast(tx, retry) {
   updateWallet(wallet, tx);
 
   fs.writeFileSync(WALLET_PATH, JSON.stringify(wallet, 0, 2));
+
+  if (res) {
+    return res.data;
+  }
+}
+
+async function getDunesForUtxos(hashes) {
+  const ordApi = axios.create({
+    baseURL: process.env.ORD,
+    timeout: 100_000,
+  });
+
+  try {
+    const response = await ordApi.get(`/outputs/${hashes.join(",")}`);
+    const parsed = response.data;
+
+    const dunes = [];
+
+    parsed.forEach((output) => {
+      if (output.dunes.length > 0) {
+        dunes.push({ dunes: output.dunes, utxo: output.txid });
+      }
+    }, []);
+
+    return dunes;
+  } catch (error) {
+    console.error("Error fetching or parsing data:", error);
+    throw error;
+  }
 }
 
 async function getDunesForUtxo(outputHash) {
@@ -1130,6 +1716,7 @@ async function getDunesForUtxo(outputHash) {
     throw error;
   }
 }
+
 async function getDune(dune) {
   const ordApi = axios.create({
     baseURL: process.env.ORD,
@@ -1142,7 +1729,7 @@ async function getDune(dune) {
     const $ = cheerio.load(data);
 
     // Extracting the information
-    let id, divisibility;
+    let id, divisibility, limit;
     $("dl dt").each((index, element) => {
       const label = $(element).text().trim();
       const value = $(element).next("dd").text().trim();
@@ -1151,13 +1738,39 @@ async function getDune(dune) {
         id = value;
       } else if (label === "divisibility") {
         divisibility = value;
+      } else if (label === "amount" || label === "limit") {
+        limit = parseInt(value.replace(/\D/g, ""), 10);
       }
     });
 
-    return { id, divisibility };
+    return { id, divisibility, limit };
   } catch (error) {
     console.error("Error fetching or parsing data:", error);
     throw error;
+  }
+}
+
+async function retryAsync(operation, maxRetries, retryInterval) {
+  try {
+    // Attempt the operation and return the result if it succeeds
+    return await operation();
+  } catch (error) {
+    console.error(`Error executing operation: ${error.message}`);
+
+    // If there are no more retries left, throw the error
+    if (maxRetries <= 0) {
+      console.error(
+        `Max retries exceeded (${maxRetries}), aborting operation.`
+      );
+      throw error;
+    }
+
+    // Wait for the specified retry interval before attempting the operation again
+    console.log(`Retrying operation in ${retryInterval} ms...`);
+    await new Promise((resolve) => setTimeout(resolve, retryInterval));
+
+    // Recursively retry the operation with one less retry and return the result if it succeeds
+    return await retryAsync(operation, maxRetries - 1, retryInterval);
   }
 }
 
